@@ -1,0 +1,4 @@
+flask
+python-docx
+flask-cors
+gunicorn
