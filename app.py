@@ -200,3 +200,4 @@ FIELD_PATTERNS = {
     "business_name": r"(?:Business\s*Name|Merchant)\s*[:\-]\s*(.+)",
     "effective_date": r"(?:Effective\s*Date)\s*[:\-]\s*([A-Za-z]{3}\s+\d{1,2}\s+\d{4}|\d{1,2}[/-]\d{1,2}[/-]\d{4}|[0-9]{4}-[0-9]{2}-[0-9]{2})",
     "advance_amount": r"(?:Advance\s*Amount|Purchase\s*Price
+ 
