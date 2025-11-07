@@ -1,14 +1,15 @@
-# app.py — PIPE Demand Letter Service (Render-ready)
+# app.py — PIPE Demand Letter Service (Render-ready with CSV statement extraction)
 
 from flask import Flask, request, send_file, abort, jsonify
 from flask_cors import CORS
-from io import BytesIO
+from io import BytesIO, StringIO
 from datetime import datetime
 from docx import Document
 from docx.shared import Pt, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from pypdf import PdfReader
 import pdfplumber
+import csv
 import os
 import re
 
@@ -44,6 +45,23 @@ def norm_date(s: str, default: str = "") -> str:
             pass
     return s
 
+def parse_date_any(s):
+    """Return datetime.date from many formats; else None."""
+    if not s:
+        return None
+    s = str(s).strip()
+    fmts = ("%b %d %Y", "%b %d, %Y", "%m %d %Y", "%m/%d/%Y", "%Y-%m-%d")
+    for fmt in fmts:
+        try:
+            return datetime.strptime(s, fmt).date()
+        except Exception:
+            continue
+    # try month abbreviations without zero-pad day (e.g., 'Nov 7 2025')
+    try:
+        return datetime.strptime(s.replace(",", ""), "%b %d %Y").date()
+    except Exception:
+        return None
+
 def parse_money(val):
     """Accept '$12,345.67' or '12345.67' and return (float, '$12,345.67')."""
     if val in (None, ""):
@@ -69,9 +87,6 @@ def normalize_rr(rr):
     f = 0.0 if f < 0 else (100.0 if f > 100 else f)
     s = f"{f:.2f}".rstrip("0").rstrip(".")
     return s + "%"
-
-def safe_str(v, fallback="") -> str:
-    return str(v) if v is not None else fallback
 
 def add_logo_if_present(doc: Document) -> None:
     """Insert letterhead logo top-left if file exists (non-fatal if missing)."""
@@ -119,7 +134,7 @@ def pdf_to_text(stream: BytesIO):
 # -------------------------------------------------
 @app.get("/")
 def index():
-    return {"status": "ok", "message": "Use POST /demand-letter (JSON) or POST /agreement-extract (file)."}, 200
+    return {"status": "ok", "message": "Use POST /demand-letter (JSON), /agreement-extract (file), or /statement-extract (CSV)."}, 200
 
 @app.get("/healthz")
 def healthz():
@@ -260,7 +275,7 @@ def demand_letter():
     )
 
 # -------------------------------------------------
-# Route: Agreement Extraction (robust summary-aware)
+# Route: Agreement Extraction (kept from earlier)
 # -------------------------------------------------
 SUMMARY_BLOCK_RE = re.compile(
     r"(?:^|\n)\s*Pipe\s+Agreement\s*[\r\n]+Summary(.*?)(?:\nPayment\s*Method|\n\d+\s+pipe\.com|$)",
@@ -357,10 +372,153 @@ def agreement_extract():
     if out.get("effective_date"):
         out["effective_date"] = norm_date(out["effective_date"])
 
-    # Debug preview in Render logs
-    print("EXTRACTED:", out)
-
+    print("EXTRACTED (agreement):", out)
     return jsonify({"ok": True, "extracted": out}), 200
+
+# -------------------------------------------------
+# NEW Route: Statement Extraction (CSV) — totals, due, paid, shortfall
+# -------------------------------------------------
+SUCCESS_STATUSES = {"succeeded", "paid", "completed", "posted", "captured", "success", "settled"}
+FAIL_STATUSES    = {"returned", "failed", "declined", "chargeback", "void", "reversed"}
+
+# Accept headers like the team uses (any case/extra spaces allowed):
+# Revenue Date | Revenue | Collected | Method | Collection Date | Source | Increase | Status | External Link | Attempts
+def _canonize(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", name.strip().lower())
+
+COLUMN_ALIASES = {
+    "revenue_date": {"revenue_date", "date", "payment_date"},
+    "revenue": {"revenue", "gross_revenue", "amount"},
+    "collected": {"collected", "pipe_collected", "to_pipe", "remitted"},
+    "status": {"status", "result"},
+    "collection_date": {"collection_date", "collected_date", "remit_date"},
+    "method": {"method", "payment_method"},
+}
+
+def _find_col(mapping, key):
+    want = COLUMN_ALIASES.get(key, {key})
+    for k, v in mapping.items():
+        if v in want:
+            return k
+    return None
+
+@app.post("/statement-extract")
+def statement_extract():
+    """
+    POST multipart/form-data:
+      - file: CSV
+      - effective_date: (string, optional) limit revenue from this date to today
+      - rr_percent: (string, optional) to compute amount due
+    Returns: totals and suggested fields to auto-fill in form.
+    """
+    require_api_key(request)
+
+    if "file" not in request.files:
+        return jsonify({"ok": False, "error": "Missing CSV file"}), 400
+    f = request.files["file"]
+    if not f or not f.filename.lower().endswith(".csv"):
+        return jsonify({"ok": False, "error": "Upload a .csv statement"}), 400
+
+    effective_date_str = request.form.get("effective_date", "").strip()
+    rr_percent_in = request.form.get("rr_percent", "").strip()
+
+    eff_date = parse_date_any(effective_date_str) if effective_date_str else None
+    rr_norm = normalize_rr(rr_percent_in) if rr_percent_in else ""
+
+    # Read CSV
+    raw = f.read().decode("utf-8", errors="ignore")
+    reader = csv.DictReader(StringIO(raw))
+    if not reader.fieldnames:
+        return jsonify({"ok": False, "error": "CSV missing header row"}), 400
+
+    # Map headers
+    mapping = {}
+    for col in reader.fieldnames:
+        mapping[col] = _canonize(col)
+
+    # Reverse-map: canonical -> actual col name
+    canon2actual = {v: k for k, v in mapping.items()}
+
+    col_rev_date = _find_col(mapping, "revenue_date")
+    col_revenue  = _find_col(mapping, "revenue")
+    col_collected = _find_col(mapping, "collected")
+    col_status   = _find_col(mapping, "status")
+
+    # Default if not found
+    if not col_revenue:
+        return jsonify({"ok": False, "error": "CSV must include a 'Revenue' column"}), 400
+    if not col_rev_date:
+        return jsonify({"ok": False, "error": "CSV must include a 'Revenue Date' column"}), 400
+    # collected/status are optional; we'll handle missing
+
+    total_revenue = 0.0
+    total_collected_success = 0.0
+
+    for row in reader:
+        try:
+            # Date filter
+            dt = parse_date_any(row.get(col_rev_date, "")) if col_rev_date else None
+            if eff_date and dt and dt < eff_date:
+                continue
+
+            # Revenue
+            rev_val = row.get(col_revenue, "")
+            rev_float = float(CURRENCY_RE.sub("", str(rev_val))) if rev_val not in (None, "") else 0.0
+            total_revenue += rev_float
+
+            # Collected (only if success-like status)
+            coll_val = row.get(col_collected, "") if col_collected else ""
+            status_val = str(row.get(col_status, "") or "").strip().lower()
+            status_canon = re.sub(r"[^a-z]", "", status_val)
+
+            if coll_val not in (None, ""):
+                coll_float = float(CURRENCY_RE.sub("", str(coll_val)))
+            else:
+                coll_float = 0.0
+
+            if status_canon in SUCCESS_STATUSES or (col_status is None and coll_float > 0):
+                total_collected_success += coll_float
+
+        except Exception:
+            # Skip any malformed lines
+            continue
+
+    # Compute RR amount due + shortfall if rr provided
+    rr_amount_due = None
+    shortfall = None
+    if rr_norm:
+        try:
+            rr = float(re.search(r"(\d+(?:\.\d+)?)", rr_norm).group(1)) / 100.0
+            rr_amount_due = total_revenue * rr
+            shortfall = max(0.0, rr_amount_due - total_collected_success)
+        except Exception:
+            rr_norm = rr_norm  # leave as is
+
+    resp = {
+        "ok": True,
+        "inputs_detected": {
+            "revenue_rows_processed": reader.line_num - 1,
+            "effective_date_applied": norm_date(effective_date_str) if eff_date else None,
+            "columns": reader.fieldnames
+        },
+        "metrics": {
+            "total_revenue": f"${total_revenue:,.2f}",
+            "successful_payments": f"${total_collected_success:,.2f}",
+            "rr_percent": rr_norm or None,
+            "rr_amount": (f"${rr_amount_due:,.2f}" if rr_amount_due is not None else None),
+            "shortfall": (f"${shortfall:,.2f}" if shortfall is not None else None),
+        },
+        # fields your form can auto-fill
+        "fill": {
+            "total_revenue": f"${total_revenue:,.2f}",
+            "successful_payments": f"${total_collected_success:,.2f}",
+            "rr_percent": rr_norm or "",
+            "rr_amount": (f"${rr_amount_due:,.2f}" if rr_amount_due is not None else ""),
+            "shortfall": (f"${shortfall:,.2f}" if shortfall is not None else "")
+        }
+    }
+    print("EXTRACTED (statement):", resp["metrics"])
+    return jsonify(resp), 200
 
 # -------------------------------------------------
 # Local run (optional)
