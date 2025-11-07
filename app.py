@@ -1,54 +1,88 @@
+# app.py — Pipe Demand Letter Service (Render-ready)
+
 from flask import Flask, request, send_file, abort, jsonify
-from io import BytesIO
-from docx import Document
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.shared import Pt, Inches
-from datetime import datetime
 from flask_cors import CORS
+from io import BytesIO
+from datetime import datetime
+from docx import Document
+from docx.shared import Pt, Inches
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from pypdf import PdfReader
+import pdfplumber
 import os
 import re
 
+# -----------------------------
+# App & Config
+# -----------------------------
 app = Flask(__name__)
-CORS(app)  # allow Apps Script origin
+# Allow requests from Google Apps Script and anywhere else (tighten if desired)
+CORS(app)
+
 API_KEY = os.getenv("PIPE_DEMAND_API_KEY", "YOUR_SECRET_KEY")
+LETTERHEAD_IMAGE = os.getenv("PIPE_LETTERHEAD_IMAGE", "pipe_letterhead.png")  # optional logo file in repo root
 
-# Optional: if you add a file named 'pipe_letterhead.png' to the repo root, we'll place it at the top.
-LETTERHEAD_IMAGE = os.getenv("PIPE_LETTERHEAD_IMAGE", "pipe_letterhead.png")
+# -----------------------------
+# Helpers
+# -----------------------------
 
-# --- helpers ---
-def norm_date(s, default=""):
+def require_api_key(req) -> None:
+    """Abort 401 if header key doesn't match env var."""
+    if req.headers.get("X-API-KEY") != API_KEY:
+        abort(401, description="Unauthorized: Invalid API key.")
+
+def norm_date(s: str, default: str = "") -> str:
+    """Normalize many common date inputs to 'MMM DD YYYY'."""
     if not s:
         return default
-    s = s.strip()
-    # accept "Nov 06 2025" OR "Nov 06, 2025" OR "11 06 2025"
-    for fmt in ("%b %d %Y", "%b %d, %Y", "%m %d %Y", "%m/%d/%Y"):
+    s = str(s).strip()
+    fmts = ("%b %d %Y", "%b %d, %Y", "%m %d %Y", "%m/%d/%Y", "%Y-%m-%d")
+    for fmt in fmts:
         try:
             return datetime.strptime(s, fmt).strftime("%b %d %Y")
         except Exception:
             pass
-    return s  # leave as-is if user typed something custom
+    return s  # leave as-is if unknown
 
-def money(s):
-    if s in (None, ""):
+def money(val) -> str:
+    """Format as $X,XXX.XX (accepts strings with $/commas)."""
+    if val in (None, ""):
         return ""
     try:
-        v = float(re.sub(r"[^0-9.\-]", "", str(s)))
+        v = float(re.sub(r"[^0-9.\-]", "", str(val)))
         return f"${v:,.2f}"
     except Exception:
-        return str(s)
+        return str(val)
 
-def require_api_key(req):
-    if req.headers.get("X-API-KEY") != API_KEY:
-        abort(401, description="Unauthorized: Invalid API key.")
+def safe_str(v, fallback="") -> str:
+    return str(v) if v is not None else fallback
 
+def add_logo_if_present(doc: Document) -> None:
+    """Insert letterhead logo if file exists (non-fatal if missing)."""
+    try:
+        if os.path.isfile(LETTERHEAD_IMAGE):
+            p = doc.add_paragraph()
+            run = p.add_run()
+            run.add_picture(LETTERHEAD_IMAGE, width=Inches(1.6))
+            p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    except Exception:
+        # ignore image issues silently
+        pass
+
+# -----------------------------
+# Routes: health & index
+# -----------------------------
 @app.get("/")
 def index():
-    return {"status": "ok", "message": "Use POST /demand-letter to generate a DOCX."}, 200
+    return {"status": "ok", "message": "Use POST /demand-letter (JSON) or POST /agreement-extract (file)."}, 200
 
 @app.get("/healthz")
 def healthz():
     return {"status": "ok"}, 200
 
+# -----------------------------
+# Route: Generate Demand Letter
+# -----------------------------
 @app.post("/demand-letter")
 def demand_letter():
     require_api_key(request)
@@ -58,35 +92,37 @@ def demand_letter():
     except Exception:
         return jsonify({"error": "Invalid JSON body"}), 400
 
-    # --- pull fields (use your checklist names if present, fallback otherwise) ---
+    # Extract inputs (accept both short and long names)
     business_name = data.get("business_name") or data.get("Business Name") or "BUSINESS NAME"
     business_address = data.get("business_address") or data.get("Business Address") or "Business address"
+    contact_name = data.get("contact_name") or data.get("Contact Name") or "Client"
     today = norm_date(data.get("today") or data.get("Today") or datetime.utcnow().strftime("%b %d %Y"))
     effective_date = norm_date(data.get("effective_date") or data.get("Effective Date"))
+    default_date = norm_date(data.get("default_date") or data.get("Date of Default Event"))
+    last_payment_date = norm_date(data.get("last_payment_date") or data.get("Date of Last Payment"))
+
     total_adv_plus_fee = money(data.get("total_advance_plus_fee") or data.get("Total Advance + Fee"))
     advance_amount = money(data.get("advance_amount") or data.get("Advance Amount"))
     fee = money(data.get("fee") or data.get("Fee"))
-    default_date = norm_date(data.get("default_date") or data.get("Date of Default Event"))
     total_revenue = money(data.get("total_revenue") or data.get("Total Revenue Since Agreement to Today"))
-    rr_percent = (data.get("rr_percent") or data.get("Revenue Share Percentage (RR%)") or "").strip()
+    rr_percent = safe_str(data.get("rr_percent") or data.get("Revenue Share Percentage (RR%)")).strip()
     rr_amount = money(data.get("rr_amount") or data.get("Calculated % of Revenue Payable to Pipe ($)"))
     successful_payments = money(data.get("successful_payments") or data.get("Amount of Successful Payments"))
-    last_payment_date = norm_date(data.get("last_payment_date") or data.get("Date of Last Payment"))
-    percent_or_amount_due = money(data.get("percent_or_amount_due") or data.get("Payment Percentage or Amount Due ($% of Revenue Amount)"))
+    percent_or_amount_due = money(
+        data.get("percent_or_amount_due")
+        or data.get("Payment Percentage or Amount Due ($% of Revenue Amount)")
+    )
     shortfall = money(data.get("shortfall") or data.get("Shortfall"))
 
-    # --- build DOCX ---
+    # Build DOCX
     doc = Document()
+    # Base font
+    style = doc.styles["Normal"]
+    style.font.name = "Times New Roman"
+    style.font.size = Pt(12)
 
-    # Try to add letterhead image if present
-    try:
-        if os.path.isfile(LETTERHEAD_IMAGE):
-            p_img = doc.add_paragraph()
-            run_img = p_img.add_run()
-            run_img.add_picture(LETTERHEAD_IMAGE, width=Inches(1.6))
-            p_img.alignment = WD_ALIGN_PARAGRAPH.LEFT
-    except Exception:
-        pass  # ignore logo failures
+    # Optional logo
+    add_logo_if_present(doc)
 
     # Title
     title = doc.add_paragraph("LETTER OF DEMAND")
@@ -94,24 +130,24 @@ def demand_letter():
     title.runs[0].bold = True
 
     # Address block
-    doc.add_paragraph(f"{business_name}\n{business_address}\nUnited States of America\n\n")
+    doc.add_paragraph(f"{business_name}\n{business_address}\nUnited States of America\n")
 
-    # SENT VIA...
-    sent_line = doc.add_paragraph(f"SENT VIA EMAIL ON {today}")
-    sent_line.runs[0].bold = True
-    doc.add_paragraph("\n")
+    # SENT VIA EMAIL ON ...
+    sent_p = doc.add_paragraph(f"SENT VIA EMAIL ON {today}")
+    sent_p.runs[0].bold = True
+    doc.add_paragraph("")  # spacer
 
     # Re: line
-    re_line = doc.add_paragraph("Re: Demand for Payment - Pipe Merchant Cash Advance")
-    re_line.runs[0].bold = True
-    doc.add_paragraph("\n")
+    re_p = doc.add_paragraph("Re: Demand for Payment - Pipe Merchant Cash Advance")
+    re_p.runs[0].bold = True
+    doc.add_paragraph("")  # spacer
 
-    # Dear Client
-    dear = doc.add_paragraph("Dear Client,")
+    # Dear
+    dear = doc.add_paragraph(f"Dear {contact_name},")
     dear.runs[0].bold = True
-    doc.add_paragraph("\n")
+    doc.add_paragraph("")  # spacer
 
-    # BODY — exact approved copy with your fields filled in
+    # Body — approved copy with fields
     body = (
         f"This is our last attempt and FINAL WARNING to seek payment for {business_name}’s merchant cash advance (“MCA”) "
         f"before we seek all legal remedies available to us. {business_name}(“you”) entered into an MCA Agreement "
@@ -143,11 +179,12 @@ def demand_letter():
         "Pipe Advance  LLC"
     )
 
-    # return file
+    # Return DOCX
     buf = BytesIO()
     doc.save(buf)
     buf.seek(0)
     fname = f"Demand_Letter_{re.sub(r'\\s+', '_', business_name)}.docx"
+
     return send_file(
         buf,
         mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -155,5 +192,11 @@ def demand_letter():
         download_name=fname
     )
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+# -----------------------------
+# Route: Agreement Extraction
+# -----------------------------
+FIELD_PATTERNS = {
+    # Tweak these regexes to match your agreement language precisely
+    "business_name": r"(?:Business\s*Name|Merchant)\s*[:\-]\s*(.+)",
+    "effective_date": r"(?:Effective\s*Date)\s*[:\-]\s*([A-Za-z]{3}\s+\d{1,2}\s+\d{4}|\d{1,2}[/-]\d{1,2}[/-]\d{4}|[0-9]{4}-[0-9]{2}-[0-9]{2})",
+    "advance_amount": r"(?:Advance\s*Amount|Purchase\s*Price
