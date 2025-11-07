@@ -1,4 +1,4 @@
-# app.py — Pipe Demand Letter Service (Render-ready)
+# app.py — PIPE Demand Letter Service (Render-ready)
 
 from flask import Flask, request, send_file, abort, jsonify
 from flask_cors import CORS
@@ -16,8 +16,7 @@ import re
 # App & Config
 # -----------------------------
 app = Flask(__name__)
-# Allow requests from Google Apps Script and anywhere else (tighten if desired)
-CORS(app)
+CORS(app)  # allow Google Apps Script and other origins
 
 API_KEY = os.getenv("PIPE_DEMAND_API_KEY", "YOUR_SECRET_KEY")
 LETTERHEAD_IMAGE = os.getenv("PIPE_LETTERHEAD_IMAGE", "pipe_letterhead.png")  # optional logo file in repo root
@@ -25,34 +24,53 @@ LETTERHEAD_IMAGE = os.getenv("PIPE_LETTERHEAD_IMAGE", "pipe_letterhead.png")  # 
 # -----------------------------
 # Helpers
 # -----------------------------
+CURRENCY_RE = re.compile(r"[^0-9.\-]")
 
 def require_api_key(req) -> None:
-    """Abort 401 if header key doesn't match env var."""
     if req.headers.get("X-API-KEY") != API_KEY:
         abort(401, description="Unauthorized: Invalid API key.")
 
 def norm_date(s: str, default: str = "") -> str:
-    """Normalize many common date inputs to 'MMM DD YYYY'."""
+    """Normalize many common date inputs to 'MMM DD, YYYY' (with comma)."""
     if not s:
         return default
     s = str(s).strip()
     fmts = ("%b %d %Y", "%b %d, %Y", "%m %d %Y", "%m/%d/%Y", "%Y-%m-%d")
     for fmt in fmts:
         try:
-            return datetime.strptime(s, fmt).strftime("%b %d %Y")
+            dt = datetime.strptime(s, fmt)
+            return dt.strftime("%b %d, %Y")
         except Exception:
             pass
-    return s  # leave as-is if unknown
+    return s
+
+def parse_money(val):
+    """Accept '$12,345.67' or '12345.67' and return (float, '$12,345.67')."""
+    if val in (None, ""):
+        return None, ""
+    try:
+        f = float(CURRENCY_RE.sub("", str(val)))
+        return f, f"${f:,.2f}"
+    except Exception:
+        return None, str(val)
 
 def money(val) -> str:
-    """Format as $X,XXX.XX (accepts strings with $/commas)."""
-    if val in (None, ""):
+    """String-only pretty $ format."""
+    _, pretty = parse_money(val)
+    return pretty
+
+def normalize_rr(rr):
+    """Accept '14', '14%', '14.0 something' → '14%'."""
+    if not rr:
         return ""
-    try:
-        v = float(re.sub(r"[^0-9.\-]", "", str(val)))
-        return f"${v:,.2f}"
-    except Exception:
-        return str(val)
+    m = re.search(r"(\d+(?:\.\d+)?)", str(rr))
+    if not m:
+        return str(rr)
+    f = float(m.group(1))
+    if f < 0: f = 0.0
+    if f > 100: f = 100.0
+    s = f"{f:.2f}".rstrip("0").rstrip(".")
+    return s + "%"
 
 def safe_str(v, fallback="") -> str:
     return str(v) if v is not None else fallback
@@ -66,8 +84,37 @@ def add_logo_if_present(doc: Document) -> None:
             run.add_picture(LETTERHEAD_IMAGE, width=Inches(1.6))
             p.alignment = WD_ALIGN_PARAGRAPH.LEFT
     except Exception:
-        # ignore image issues silently
         pass
+
+def docx_to_text(stream: BytesIO):
+    """Optional DOCX extraction (kept minimal)."""
+    try:
+        from docx import Document as DocxDocument
+        d = DocxDocument(stream)
+        return "\n".join(p.text or "" for p in d.paragraphs)
+    except Exception:
+        return None
+
+def pdf_to_text(stream: BytesIO):
+    """Extract text from text-based PDFs. Try pypdf, then pdfplumber."""
+    text = []
+    try:
+        reader = PdfReader(stream)
+        for p in reader.pages:
+            text.append(p.extract_text() or "")
+        joined = "\n".join(text)
+        if joined.strip():
+            return joined
+    except Exception:
+        pass
+    try:
+        stream.seek(0)
+        with pdfplumber.open(stream) as pdf:
+            for page in pdf.pages:
+                text.append(page.extract_text() or "")
+        return "\n".join(text)
+    except Exception:
+        return None
 
 # -----------------------------
 # Routes: health & index
@@ -96,26 +143,56 @@ def demand_letter():
     business_name = data.get("business_name") or data.get("Business Name") or "BUSINESS NAME"
     business_address = data.get("business_address") or data.get("Business Address") or "Business address"
     contact_name = data.get("contact_name") or data.get("Contact Name") or "Client"
-    today = norm_date(data.get("today") or data.get("Today") or datetime.utcnow().strftime("%b %d %Y"))
+
+    today = norm_date(data.get("today") or data.get("Today") or datetime.utcnow().strftime("%b %d, %Y"))
     effective_date = norm_date(data.get("effective_date") or data.get("Effective Date"))
     default_date = norm_date(data.get("default_date") or data.get("Date of Default Event"))
     last_payment_date = norm_date(data.get("last_payment_date") or data.get("Date of Last Payment"))
 
-    total_adv_plus_fee = money(data.get("total_advance_plus_fee") or data.get("Total Advance + Fee"))
-    advance_amount = money(data.get("advance_amount") or data.get("Advance Amount"))
-    fee = money(data.get("fee") or data.get("Fee"))
-    total_revenue = money(data.get("total_revenue") or data.get("Total Revenue Since Agreement to Today"))
-    rr_percent = safe_str(data.get("rr_percent") or data.get("Revenue Share Percentage (RR%)")).strip()
-    rr_amount = money(data.get("rr_amount") or data.get("Calculated % of Revenue Payable to Pipe ($)"))
-    successful_payments = money(data.get("successful_payments") or data.get("Amount of Successful Payments"))
-    percent_or_amount_due = money(
-        data.get("percent_or_amount_due")
-        or data.get("Payment Percentage or Amount Due ($% of Revenue Amount)")
-    )
-    shortfall = money(data.get("shortfall") or data.get("Shortfall"))
+    total_adv_plus_fee_raw = data.get("total_advance_plus_fee") or data.get("Total Advance + Fee")
+    advance_amount_raw      = data.get("advance_amount")       or data.get("Advance Amount")
+    fee_raw                 = data.get("fee")                  or data.get("Fee")
+    total_revenue_raw       = data.get("total_revenue")        or data.get("Total Revenue Since Agreement to Today")
+    rr_percent_raw          = data.get("rr_percent")           or data.get("Revenue Share Percentage (RR%)")
+    rr_amount_raw           = data.get("rr_amount")            or data.get("Calculated % of Revenue Payable to Pipe ($)")
+    successful_payments_raw = data.get("successful_payments")  or data.get("Amount of Successful Payments")
+    percent_or_amount_due   = money(data.get("percent_or_amount_due") or data.get("Payment Percentage or Amount Due ($% of Revenue Amount)"))
+    shortfall_raw           = data.get("shortfall")            or data.get("Shortfall")
+
+    # Normalize values
+    total_adv_plus_fee = money(total_adv_plus_fee_raw)
+    advance_amount     = money(advance_amount_raw)
+    fee                = money(fee_raw)
+    total_revenue      = money(total_revenue_raw)
+    rr_percent         = normalize_rr(rr_percent_raw)
+
+    _, rr_amount_money = parse_money(rr_amount_raw)
+    _, successful_payments_money = parse_money(successful_payments_raw)
+    _, shortfall_money = parse_money(shortfall_raw)
+
+    # Auto-calc rr_amount if blank and possible
+    if not rr_amount_money and total_revenue_raw and rr_percent:
+        try:
+            rr = float(re.search(r"(\d+(?:\.\d+)?)", rr_percent).group(1)) / 100.0
+            tr = float(CURRENCY_RE.sub("", str(total_revenue_raw)))
+            rr_calc = tr * rr
+            rr_amount_money = f"${rr_calc:,.2f}"
+        except Exception:
+            pass
+
+    # Auto-calc shortfall if blank and both rr_amount & successful payments exist
+    if not shortfall_money and rr_amount_money and successful_payments_raw:
+        try:
+            rr_float = float(CURRENCY_RE.sub("", rr_amount_money))
+            sp_float = float(CURRENCY_RE.sub("", successful_payments_raw))
+            diff = max(0.0, rr_float - sp_float)
+            shortfall_money = f"${diff:,.2f}"
+        except Exception:
+            pass
 
     # Build DOCX
     doc = Document()
+
     # Base font
     style = doc.styles["Normal"]
     style.font.name = "Times New Roman"
@@ -147,43 +224,46 @@ def demand_letter():
     dear.runs[0].bold = True
     doc.add_paragraph("")  # spacer
 
-    # Body — approved copy with fields
+    # Body — polished copy with normalized fields
     body = (
         f"This is our last attempt and FINAL WARNING to seek payment for {business_name}’s merchant cash advance (“MCA”) "
-        f"before we seek all legal remedies available to us. {business_name}(“you”) entered into an MCA Agreement "
-        f"(“Agreement”) with Pipe Advancel LLC (the “Company”) dated {effective_date} (the “Effective Date”) for an MCA in "
-        f"the total amount of {total_adv_plus_fee} (consisting of a MCA advance of {advance_amount} and a fee of {fee}).\n\n"
+        f"before we seek all legal remedies available to us. {business_name} (“you”) entered into an MCA Agreement "
+        f"(“Agreement”) with Pipe Advance LLC (the “Company”) dated {effective_date} (the “Effective Date”) for an MCA in "
+        f"the total amount of {total_adv_plus_fee} (consisting of an MCA advance of {advance_amount} and a fee of {fee}).\n\n"
 
         f"Since {default_date}, {business_name} has failed to comply with its terms, by generating revenue and failing to "
         f"deliver and/or preventing Pipe from receiving its share of revenue payments. As of {today}, {business_name} has had "
-        f"{total_revenue} in revenue payments of which {rr_percent} ({rr_amount}) are payable to Pipe under the terms of the Agreement. "
-        f"We have only received {successful_payments} towards your Total Advance Amount. The last payment to Pipe was on {last_payment_date}.\n\n"
+        f"{total_revenue} in revenue payments of which {rr_percent} ({rr_amount_money or money(rr_amount_raw)}) are payable to Pipe "
+        f"under the terms of the Agreement. We have only received {successful_payments_money or money(successful_payments_raw)} "
+        f"towards your Total Advance Amount. The last payment to Pipe was on {last_payment_date}.\n\n"
 
         f"Your failure to pay Pipe the agreed upon percentage of revenue {percent_or_amount_due}, is a breach of the Agreement. "
         f"We have attempted to contact you and resolve this issue informally multiple times. Despite Pipe’s continuous efforts to "
         f"resolve this issue, we have not received a payment.\n\n"
 
-        f"If a payment of {shortfall} is not received within 3 business days of receipt of this letter, we will seek all remedies "
-        f"available to us under the Agreement, including referring this matter to a third-party collections firm or seeking appropriate "
-        f"legal action. You may also be held liable and subject to additional fees incurred by Pipe in an attempt to pursue these payments.\n\n"
+        f"If a payment of {shortfall_money or money(shortfall_raw)} is not received within 3 business days of receipt of this letter, "
+        f"we will seek all remedies available to us under the Agreement, including referring this matter to a third-party collections "
+        f"firm or seeking appropriate legal action. You may also be held liable and subject to additional fees incurred by Pipe in an "
+        f"attempt to pursue these payments.\n\n"
 
         f"We urge you to treat this matter with the utmost urgency and to cooperate fully in resolving this breach amicably.\n\n"
     )
     doc.add_paragraph(body)
 
-    # Footer/contact
+    # Footer/contact (typo fixed; single space)
     doc.add_paragraph(
         "Please contact our Servicing and Collections Manager, William, at william@pipe.com immediately within the next 3 business days.\n\n"
         "Thank you for your immediate attention to this critical issue.\n\n"
         "Servicing and Collections\n"
-        "Pipe Advance  LLC"
+        "Pipe Advance LLC"
     )
 
     # Return DOCX
     buf = BytesIO()
     doc.save(buf)
     buf.seek(0)
-    fname = f"Demand_Letter_{re.sub(r'\\s+', '_', business_name)}.docx"
+    safe_name = re.sub(r"\s+", "_", business_name)
+    fname = f"Demand_Letter_{safe_name}.docx"
 
     return send_file(
         buf,
@@ -196,8 +276,80 @@ def demand_letter():
 # Route: Agreement Extraction
 # -----------------------------
 FIELD_PATTERNS = {
-    # Tweak these regexes to match your agreement language precisely
-    "business_name": r"(?:Business\s*Name|Merchant)\s*[:\-]\s*(.+)",
-    "effective_date": r"(?:Effective\s*Date)\s*[:\-]\s*([A-Za-z]{3}\s+\d{1,2}\s+\d{4}|\d{1,2}[/-]\d{1,2}[/-]\d{4}|[0-9]{4}-[0-9]{2}-[0-9]{2})",
-    "advance_amount": r"(?:Advance\s*Amount|Purchase\s*Price
- 
+    # Company / Merchant
+    "business_name": r"(?:Merchant|Business Name)\s*[:\s]\s*([A-Za-z0-9&.,' \-]+)",
+
+    # Dates
+    "effective_date": r"Effective\s*Date\s*[:\s]\s*([A-Za-z]{3,9}\s+\d{1,2}[,]?\s+\d{4}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2})",
+
+    # Amounts
+    "advance_amount": r"(?:Advance\s*Amount|Purchase\s*Price)\s*[:\s]\s*\$?([\d,]+(?:\.\d{2})?)",
+    "fee":            r"(?:Fee|Origination\s*Fee|Financing\s*Fee)\s*[:\s]\s*\$?([\d,]+(?:\.\d{2})?)",
+    "total_advance_plus_fee": r"(?:Total\s*(?:Payment|Advance|Purchase)\s*(?:Amount|Obligation))\s*[:\s]\s*\$?([\d,]+(?:\.\d{2})?)",
+
+    # RR% (Payment/Remittance Rate)
+    "rr_percent": r"(?:Payment\s*Rate|Remittance\s*Rate|Revenue\s*Share|RR%?)\s*[:\s]\s*([0-9]{1,2}(?:\.\d+)?%?)",
+
+    # Optional context fields
+    "partner": r"(?:Partner|Processor)\s*[:\s]\s*([A-Za-z0-9&.,' \-]+)",
+    "product": r"(?:Product|Capital\s*Product\s*Type)\s*[:\s]\s*([A-Za-z0-9&.,' \-]+)",
+}
+
+@app.post("/agreement-extract")
+def agreement_extract():
+    require_api_key(request)
+
+    if "file" not in request.files:
+        return jsonify({"ok": False, "error": "Missing file"}), 400
+
+    f = request.files["file"]
+    if not f or not f.filename:
+        return jsonify({"ok": False, "error": "Empty filename"}), 400
+
+    name = f.filename.lower()
+    stream = BytesIO(f.read())
+    stream.seek(0)
+
+    # Try DOCX first, then PDF
+    text = None
+    if name.endswith(".docx"):
+        text = docx_to_text(stream)
+    if not text:
+        stream.seek(0)
+        text = pdf_to_text(stream)
+
+    if not text or not text.strip():
+        return jsonify({
+            "ok": False,
+            "error": "Could not read agreement text. If this is a scanned PDF, upload a text-based copy or paste terms."
+        }), 422
+
+    extracted = {}
+    for k, pat in FIELD_PATTERNS.items():
+        m = re.search(pat, text, flags=re.IGNORECASE)
+        extracted[k] = (m.group(1).strip() if m else None)
+
+    # Normalize outputs
+    if extracted.get("effective_date"):
+        extracted["effective_date"] = norm_date(extracted["effective_date"])
+
+    for mkey in ("advance_amount", "fee", "total_advance_plus_fee"):
+        if extracted.get(mkey):
+            _, pretty = parse_money(extracted[mkey])
+            extracted[mkey] = pretty
+
+    if extracted.get("rr_percent"):
+        extracted["rr_percent"] = normalize_rr(extracted["rr_percent"])
+
+    return jsonify({
+        "ok": True,
+        "extracted": extracted,
+        "raw_preview": text[:4000]  # truncate preview for debugging
+    }), 200
+
+# -----------------------------
+# Local run (optional)
+# -----------------------------
+if __name__ == "__main__":
+    # For local testing only; Render uses gunicorn with $PORT
+    app.run(host="0.0.0.0", port=8080)
