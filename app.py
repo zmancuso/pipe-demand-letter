@@ -12,18 +12,18 @@ import pdfplumber
 import os
 import re
 
-# -----------------------------
+# -------------------------------------------------
 # App & Config
-# -----------------------------
+# -------------------------------------------------
 app = Flask(__name__)
 CORS(app)  # allow Google Apps Script and other origins
 
 API_KEY = os.getenv("PIPE_DEMAND_API_KEY", "YOUR_SECRET_KEY")
 LETTERHEAD_IMAGE = os.getenv("PIPE_LETTERHEAD_IMAGE", "pipe_letterhead.png")  # optional file in repo root
 
-# -----------------------------
+# -------------------------------------------------
 # Helpers
-# -----------------------------
+# -------------------------------------------------
 CURRENCY_RE = re.compile(r"[^0-9.\-]")
 
 def require_api_key(req) -> None:
@@ -31,7 +31,7 @@ def require_api_key(req) -> None:
         abort(401, description="Unauthorized: Invalid API key.")
 
 def norm_date(s: str, default: str = "") -> str:
-    """Normalize many common date inputs to 'MMM DD, YYYY' (with comma)."""
+    """Normalize many common date inputs to 'MMM DD, YYYY'."""
     if not s:
         return default
     s = str(s).strip()
@@ -55,20 +55,18 @@ def parse_money(val):
         return None, str(val)
 
 def money(val) -> str:
-    """String-only pretty $ format."""
     _, pretty = parse_money(val)
     return pretty
 
 def normalize_rr(rr):
-    """Accept '14', '14%', '14.0 foo' → '14%'."""
+    """Accept '14', '14%', '14.0 foo' => '14%'."""
     if not rr:
         return ""
     m = re.search(r"(\d+(?:\.\d+)?)", str(rr))
     if not m:
         return str(rr)
     f = float(m.group(1))
-    if f < 0: f = 0.0
-    if f > 100: f = 100.0
+    f = 0.0 if f < 0 else (100.0 if f > 100 else f)
     s = f"{f:.2f}".rstrip("0").rstrip(".")
     return s + "%"
 
@@ -116,9 +114,9 @@ def pdf_to_text(stream: BytesIO):
     except Exception:
         return None
 
-# -----------------------------
+# -------------------------------------------------
 # Routes: health & index
-# -----------------------------
+# -------------------------------------------------
 @app.get("/")
 def index():
     return {"status": "ok", "message": "Use POST /demand-letter (JSON) or POST /agreement-extract (file)."}, 200
@@ -127,9 +125,9 @@ def index():
 def healthz():
     return {"status": "ok"}, 200
 
-# -----------------------------
+# -------------------------------------------------
 # Route: Generate Demand Letter
-# -----------------------------
+# -------------------------------------------------
 @app.post("/demand-letter")
 def demand_letter():
     require_api_key(request)
@@ -139,7 +137,7 @@ def demand_letter():
     except Exception:
         return jsonify({"error": "Invalid JSON body"}), 400
 
-    # Extract inputs (accept both short and long names)
+    # Inputs (accept both short and long names)
     business_name = data.get("business_name") or data.get("Business Name") or "BUSINESS NAME"
     business_address = data.get("business_address") or data.get("Business Address") or "Business address"
     contact_name = data.get("contact_name") or data.get("Contact Name") or "Client"
@@ -159,7 +157,7 @@ def demand_letter():
     percent_or_amount_due   = money(data.get("percent_or_amount_due") or data.get("Payment Percentage or Amount Due ($% of Revenue Amount)"))
     shortfall_raw           = data.get("shortfall")            or data.get("Shortfall")
 
-    # Normalize values
+    # Normalize
     total_adv_plus_fee = money(total_adv_plus_fee_raw)
     advance_amount     = money(advance_amount_raw)
     fee                = money(fee_raw)
@@ -170,7 +168,7 @@ def demand_letter():
     _, successful_payments_money = parse_money(successful_payments_raw)
     _, shortfall_money = parse_money(shortfall_raw)
 
-    # Auto-calc rr_amount if blank and possible
+    # Auto-calc RR amount if blank
     if not rr_amount_money and total_revenue_raw and rr_percent:
         try:
             rr = float(re.search(r"(\d+(?:\.\d+)?)", rr_percent).group(1)) / 100.0
@@ -180,7 +178,7 @@ def demand_letter():
         except Exception:
             pass
 
-    # Auto-calc shortfall if blank and both rr_amount & successful payments exist
+    # Auto-calc shortfall if blank
     if not shortfall_money and rr_amount_money and successful_payments_raw:
         try:
             rr_float = float(CURRENCY_RE.sub("", rr_amount_money))
@@ -192,43 +190,34 @@ def demand_letter():
 
     # Build DOCX
     doc = Document()
-
-    # Base font
     style = doc.styles["Normal"]
     style.font.name = "Times New Roman"
     style.font.size = Pt(12)
 
-    # Optional logo (top-left, ~1.6" width)
-    add_logo_if_present(doc)
+    add_logo_if_present(doc)  # top-left logo ~1.6"
 
-    # Title
     title = doc.add_paragraph("LETTER OF DEMAND")
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
     title.runs[0].bold = True
 
-    # Address block
     doc.add_paragraph(f"{business_name}\n{business_address}\nUnited States of America\n")
 
-    # SENT VIA EMAIL ON ...
     sent_p = doc.add_paragraph(f"SENT VIA EMAIL ON {today}")
     sent_p.runs[0].bold = True
-    doc.add_paragraph("")  # spacer
+    doc.add_paragraph("")
 
-    # Re: line
     re_p = doc.add_paragraph("Re: Demand for Payment - Pipe Merchant Cash Advance")
     re_p.runs[0].bold = True
-    doc.add_paragraph("")  # spacer
+    doc.add_paragraph("")
 
-    # Dear
     dear = doc.add_paragraph(f"Dear {contact_name},")
     dear.runs[0].bold = True
-    doc.add_paragraph("")  # spacer
+    doc.add_paragraph("")
 
-    # Body — polished copy with normalized fields
     body = (
-        f"This is our last attempt and FINAL WARNING to seek payment for {business_name}’s merchant cash advance (“MCA”) "
-        f"before we seek all legal remedies available to us. {business_name} (“you”) entered into an MCA Agreement "
-        f"(“Agreement”) with Pipe Advance LLC (the “Company”) dated {effective_date} (the “Effective Date”) for an MCA in "
+        f"This is our last attempt and FINAL WARNING to seek payment for {business_name}'s merchant cash advance (\"MCA\") "
+        f"before we seek all legal remedies available to us. {business_name} (\"you\") entered into an MCA Agreement "
+        f"(\"Agreement\") with Pipe Advance LLC (the \"Company\") dated {effective_date} (the \"Effective Date\") for an MCA in "
         f"the total amount of {total_adv_plus_fee} (consisting of an MCA advance of {advance_amount} and a fee of {fee}).\n\n"
 
         f"Since {default_date}, {business_name} has failed to comply with its terms, by generating revenue and failing to "
@@ -238,7 +227,7 @@ def demand_letter():
         f"towards your Total Advance Amount. The last payment to Pipe was on {last_payment_date}.\n\n"
 
         f"Your failure to pay Pipe the agreed upon percentage of revenue {percent_or_amount_due}, is a breach of the Agreement. "
-        f"We have attempted to contact you and resolve this issue informally multiple times. Despite Pipe’s continuous efforts to "
+        f"We have attempted to contact you and resolve this issue informally multiple times. Despite Pipe's continuous efforts to "
         f"resolve this issue, we have not received a payment.\n\n"
 
         f"If a payment of {shortfall_money or money(shortfall_raw)} is not received within 3 business days of receipt of this letter, "
@@ -250,7 +239,6 @@ def demand_letter():
     )
     doc.add_paragraph(body)
 
-    # Footer/contact
     doc.add_paragraph(
         "Please contact our Servicing and Collections Manager, William, at william@pipe.com immediately within the next 3 business days.\n\n"
         "Thank you for your immediate attention to this critical issue.\n\n"
@@ -258,7 +246,6 @@ def demand_letter():
         "Pipe Advance LLC"
     )
 
-    # Return DOCX
     buf = BytesIO()
     doc.save(buf)
     buf.seek(0)
@@ -272,28 +259,23 @@ def demand_letter():
         download_name=fname
     )
 
-# -----------------------------
-# Route: Agreement Extraction
-# -----------------------------
-FIELD_PATTERNS = {
-    # Merchant / Business
-    "business_name": r"(?:Merchant|Business\s*Name|Merchant\s*Name)\s*[:\-–]\s*([A-Za-z0-9&.,' \-]+)",
+# -------------------------------------------------
+# Route: Agreement Extraction (robust summary-aware)
+# -------------------------------------------------
+SUMMARY_BLOCK_RE = re.compile(
+    r"(?:^|\n)\s*Pipe\s+Agreement\s*[\r\n]+Summary(.*?)(?:\nPayment\s*Method|\n\d+\s+pipe\.com|$)",
+    re.IGNORECASE | re.DOTALL
+)
 
-    # Dates (Effective/Agreement/Dated)
-    "effective_date": r"(?:Effective\s*Date|Agreement\s*Date|Dated)\s*[:\-–]\s*([A-Za-z]{3,9}\s+\d{1,2}[,]?\s+\d{4}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2})",
+def _first_group(pattern, text, flags=re.IGNORECASE | re.DOTALL):
+    m = re.search(pattern, text, flags)
+    return m.group(1).strip() if m else None
 
-    # Amounts
-    "advance_amount": r"(?:Advance\s*Amount|Purchased\s*Amount|Purchase\s*Price|Funding\s*Amount)\s*[:\-–]\s*\$?\s*([\d,]+(?:\.\d{2})?)",
-    "fee":            r"(?:Fee|Origination\s*Fee|Financing\s*Fee|Facility\s*Fee|Total\s*Fee)\s*[:\-–]\s*\$?\s*([\d,]+(?:\.\d{2})?)",
-    "total_advance_plus_fee": r"(?:Total\s*(?:Payment|Advance|Purchase|Obligation|Repayment)\s*(?:Amount)?)\s*[:\-–]\s*\$?\s*([\d,]+(?:\.\d{2})?)",
-
-    # RR% (various terms)
-    "rr_percent": r"(?:Payment\s*Rate|Remittance\s*Rate|Withholding\s*Rate|Revenue\s*Share|Remit\s*Rate|RR%?)\s*[:\-–]\s*([0-9]{1,2}(?:\.\d+)?%?)",
-
-    # Optional context
-    "partner": r"(?:Partner|Processor)\s*[:\-–]\s*([A-Za-z0-9&.,' \-]+)",
-    "product": r"(?:Product|Capital\s*Product\s*Type)\s*[:\-–]\s*([A-Za-z0-9&.,' \-]+)",
-}
+def _money_pretty(s):
+    if not s:
+        return None
+    _, pretty = parse_money(s)
+    return pretty or s
 
 @app.post("/agreement-extract")
 def agreement_extract():
@@ -301,16 +283,14 @@ def agreement_extract():
 
     if "file" not in request.files:
         return jsonify({"ok": False, "error": "Missing file"}), 400
-
     f = request.files["file"]
     if not f or not f.filename:
         return jsonify({"ok": False, "error": "Empty filename"}), 400
 
     name = f.filename.lower()
-    stream = BytesIO(f.read())
-    stream.seek(0)
+    stream = BytesIO(f.read()); stream.seek(0)
 
-    # Extract text (DOCX or PDF)
+    # Read text (DOCX or PDF)
     text = None
     if name.endswith(".docx"):
         text = docx_to_text(stream)
@@ -319,74 +299,71 @@ def agreement_extract():
         text = pdf_to_text(stream)
 
     if not text or not text.strip():
-        return jsonify({
-            "ok": False,
-            "error": "Could not read agreement text. If this is a scanned PDF, use a text-based copy."
-        }), 422
+        return jsonify({"ok": False, "error": "Unable to read text (scanned PDF?)."}), 422
 
-    # Normalize whitespace to be resilient to line breaks/tabs
-    raw_text = text
-    norm = re.sub(r"[ \t]+", " ", text)
-    norm = re.sub(r"\s*[\r\n]+\s*", "\n", norm)
+    # Prefer the "Summary" panel from page 1; fallback to entire doc
+    m = SUMMARY_BLOCK_RE.search(text)
+    panel = m.group(1) if m else text
 
-    flags = re.IGNORECASE | re.MULTILINE
-    extracted = {}
-    for k, pat in FIELD_PATTERNS.items():
-        m = re.search(pat, norm, flags=flags)
-        extracted[k] = (m.group(1).strip() if m else None)
+    # Primary pulls from panel (tolerant to line breaks and spacing)
+    out = {}
 
-    # ---------- Fallback heuristics if key amounts/percent missing ----------
-    need_amounts = not any(extracted.get(k) for k in ("advance_amount", "fee", "total_advance_plus_fee"))
-    need_rate    = not extracted.get("rr_percent")
+    # Business / Merchant
+    out["business_name"] = (
+        _first_group(r"(?:^|\n)\s*Merchant\s+([^\n]+)", panel) or
+        _first_group(r"(?:^|\n)\s*Business\s*Name\s*[:\-–]\s*([^\n]+)", panel)
+    )
 
-    if need_amounts or need_rate:
-        blocks = re.split(r"\n{2,}", norm)
-        candidate = ""
-        for b in blocks:
-            if re.search(r"(schedule|summary|terms|payment|amount|rate)", b, flags=flags) and (
-                b.count("$") >= 2 or "%" in b
-            ):
-                candidate = b
-                break
+    # Effective Date
+    eff = (
+        _first_group(r"(?:^|\n)\s*Effective\s*Date\s*[:\-–]?\s*([A-Za-z]{3,9}\s+\d{1,2}[,]?\s+\d{4}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2})", panel) or
+        _first_group(r"(?:^|\n)\s*Agreement\s*Date\s*[:\-–]?\s*([^\n]+)", panel)
+    )
+    out["effective_date"] = norm_date(eff) if eff else None
 
-        if candidate:
-            if need_amounts and not extracted.get("advance_amount"):
-                m = re.search(r"(advance|purchase|funding).{0,50}\$?\s*([\d,]+(?:\.\d{2})?)", candidate, flags=flags)
-                if m: extracted["advance_amount"] = m.group(2)
-            if need_amounts and not extracted.get("fee"):
-                m = re.search(r"(fee|origination|facility).{0,50}\$?\s*([\d,]+(?:\.\d{2})?)", candidate, flags=flags)
-                if m: extracted["fee"] = m.group(2)
-            if need_amounts and not extracted.get("total_advance_plus_fee"):
-                m = re.search(r"(total\s*(payment|amount|obligation)).{0,50}\$?\s*([\d,]+(?:\.\d{2})?)", candidate, flags=flags)
-                if m: extracted["total_advance_plus_fee"] = m.group(3)
-            if need_rate and not extracted.get("rr_percent"):
-                m = re.search(r"(remit|payment|withholding|revenue\s*share|rate).{0,30}(\d{1,2}(?:\.\d+)?%?)", candidate, flags=flags)
-                if m: extracted["rr_percent"] = m.group(2)
+    # Amounts (allow descriptive text between label and $)
+    adv = _first_group(r"Advance\s*Amount[\s\S]{0,160}?\$([\d,]+(?:\.\d{2})?)", panel)
+    fee = _first_group(r"(?:^|\n)\s*Fee\b[\s\S]{0,160}?\$([\d,]+(?:\.\d{2})?)", panel)
+    tot = _first_group(r"Total\s*Payment\s*Amount[\s\S]{0,200}?\$([\d,]+(?:\.\d{2})?)", panel)
 
-    # ---------- Normalize outputs ----------
-    if extracted.get("effective_date"):
-        extracted["effective_date"] = norm_date(extracted["effective_date"])
+    out["advance_amount"]         = _money_pretty(adv)
+    out["fee"]                    = _money_pretty(fee)
+    out["total_advance_plus_fee"] = _money_pretty(tot)
 
-    for mkey in ("advance_amount", "fee", "total_advance_plus_fee"):
-        if extracted.get(mkey):
-            _, pretty = parse_money(extracted[mkey])
-            extracted[mkey] = pretty
+    # RR% (Payment/Remittance Rate)
+    rr = _first_group(r"(?:Payment|Remittance|Withholding|Revenue\s*Share|RR%?)\s*Rate?[\s\S]{0,60}?(\d{1,2}(?:\.\d+)?%?)", panel)
+    out["rr_percent"] = normalize_rr(rr) if rr else None
 
-    if extracted.get("rr_percent"):
-        extracted["rr_percent"] = normalize_rr(extracted["rr_percent"])
+    # Partner / Processor (optional)
+    out["partner"] = _first_group(r"(?:^|\n)\s*Partner\s*[^\n]*\n([A-Za-z0-9 &'.\-]+)", panel)
 
-    # Short server-side preview for debugging (appears in Render logs)
-    print("EXTRACTED:", extracted)
-    print("TEXT PREVIEW:", raw_text[:1000])
+    # Fallbacks on whole document if still missing
+    if not out.get("advance_amount"):
+        adv2 = _first_group(r"Advance\s*Amount[\s\S]{0,200}?\$([\d,]+(?:\.\d{2})?)", text)
+        out["advance_amount"] = _money_pretty(adv2) or out.get("advance_amount")
+    if not out.get("fee"):
+        fee2 = _first_group(r"(?:^|\n)\s*Fee\b[\s\S]{0,200}?\$([\d,]+(?:\.\d{2})?)", text)
+        out["fee"] = _money_pretty(fee2) or out.get("fee")
+    if not out.get("total_advance_plus_fee"):
+        tot2 = _first_group(r"Total\s*(?:Payment|Advance|Purchase|Obligation)\s*Amount[\s\S]{0,240}?\$([\d,]+(?:\.\d{2})?)", text)
+        out["total_advance_plus_fee"] = _money_pretty(tot2) or out.get("total_advance_plus_fee")
+    if not out.get("rr_percent"):
+        rr2 = _first_group(r"(?:Payment|Remittance|Withholding|Revenue\s*Share|RR%?)\s*Rate?[\s\S]{0,80}?(\d{1,2}(?:\.\d+)?%?)", text)
+        out["rr_percent"] = normalize_rr(rr2) if rr2 else None
+    if not out.get("business_name"):
+        out["business_name"] = _first_group(r"(?:^|\n)\s*Merchant\s+([^\n]+)", text)
 
-    return jsonify({
-        "ok": True,
-        "extracted": extracted,
-        "raw_preview": raw_text[:3000]  # optional for client debug
-    }), 200
+    # Final normalizations
+    if out.get("effective_date"):
+        out["effective_date"] = norm_date(out["effective_date"])
 
-# -----------------------------
+    # Debug preview in Render logs
+    print("EXTRACTED:", out)
+
+    return jsonify({"ok": True, "extracted": out}), 200
+
+# -------------------------------------------------
 # Local run (optional)
-# -----------------------------
+# -------------------------------------------------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
