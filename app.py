@@ -17,7 +17,11 @@ import re
 # App & Config
 # -------------------------------------------------
 app = Flask(__name__)
-CORS(app)  # allow Google Apps Script and other origins
+CORS(app,
+     resources={r"/*": {"origins": "*"}},
+     allow_headers=["Content-Type", "X-API-KEY"],
+     expose_headers=["Content-Type"],
+     methods=["GET", "POST", "OPTIONS"])  # allow Google Apps Script and other origins
 
 API_KEY = os.getenv("PIPE_DEMAND_API_KEY", "YOUR_SECRET_KEY")
 LETTERHEAD_IMAGE = os.getenv("PIPE_LETTERHEAD_IMAGE", "pipe_letterhead.png")  # optional file in repo root
