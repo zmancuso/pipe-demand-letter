@@ -1,4 +1,6 @@
-flask
 python-docx
+pypdf
+pdfplumber
+flask
 flask-cors
 gunicorn
