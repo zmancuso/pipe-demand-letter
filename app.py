@@ -43,10 +43,12 @@ def demand_letter()
     doc.add_paragraph(Re Demand for Payment - Pipe Merchant Cash Advancenn)
     doc.add_paragraph(fDear {contact},nn)
     doc.add_paragraph(
-        fThis is our last attempt to seek payment for {name}'s merchant cash advance. 
-        fYou entered into an agreement dated {effective_date}. 
-        fYou defaulted on {default_date}, and your last payment was on {last_payment}. 
-        Please remit payment immediately.
+    f"This is our last attempt to seek payment for {name}'s merchant cash advance. "
+    f"You entered into an agreement dated {effective_date}. "
+    f"You defaulted on {default_date}, and your last payment was on {last_payment}. "
+    "Please remit payment immediately."
+)
+
     )
     doc.add_paragraph(nServicing and CollectionsnPipe Advance LLC)
 
