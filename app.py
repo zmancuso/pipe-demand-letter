@@ -19,7 +19,7 @@ app = Flask(__name__)
 CORS(app)  # allow Google Apps Script and other origins
 
 API_KEY = os.getenv("PIPE_DEMAND_API_KEY", "YOUR_SECRET_KEY")
-LETTERHEAD_IMAGE = os.getenv("PIPE_LETTERHEAD_IMAGE", "pipe_letterhead.png")  # optional logo file in repo root
+LETTERHEAD_IMAGE = os.getenv("PIPE_LETTERHEAD_IMAGE", "pipe_letterhead.png")  # optional file in repo root
 
 # -----------------------------
 # Helpers
@@ -60,7 +60,7 @@ def money(val) -> str:
     return pretty
 
 def normalize_rr(rr):
-    """Accept '14', '14%', '14.0 something' → '14%'."""
+    """Accept '14', '14%', '14.0 foo' → '14%'."""
     if not rr:
         return ""
     m = re.search(r"(\d+(?:\.\d+)?)", str(rr))
@@ -76,22 +76,22 @@ def safe_str(v, fallback="") -> str:
     return str(v) if v is not None else fallback
 
 def add_logo_if_present(doc: Document) -> None:
-    """Insert letterhead logo if file exists (non-fatal if missing)."""
+    """Insert letterhead logo top-left if file exists (non-fatal if missing)."""
     try:
         if os.path.isfile(LETTERHEAD_IMAGE):
             p = doc.add_paragraph()
             run = p.add_run()
-            run.add_picture(LETTERHEAD_IMAGE, width=Inches(1.6))
+            run.add_picture(LETTERHEAD_IMAGE, width=Inches(1.6))  # ~1.6" width
             p.alignment = WD_ALIGN_PARAGRAPH.LEFT
     except Exception:
         pass
 
 def docx_to_text(stream: BytesIO):
-    """Optional DOCX extraction (kept minimal)."""
+    """Extract text from DOCX (for agreements uploaded as .docx)."""
     try:
         from docx import Document as DocxDocument
         d = DocxDocument(stream)
-        return "\n".join(p.text or "" for p in d.paragraphs)
+        return "\n".join((p.text or "") for p in d.paragraphs)
     except Exception:
         return None
 
@@ -198,7 +198,7 @@ def demand_letter():
     style.font.name = "Times New Roman"
     style.font.size = Pt(12)
 
-    # Optional logo
+    # Optional logo (top-left, ~1.6" width)
     add_logo_if_present(doc)
 
     # Title
@@ -250,7 +250,7 @@ def demand_letter():
     )
     doc.add_paragraph(body)
 
-    # Footer/contact (typo fixed; single space)
+    # Footer/contact
     doc.add_paragraph(
         "Please contact our Servicing and Collections Manager, William, at william@pipe.com immediately within the next 3 business days.\n\n"
         "Thank you for your immediate attention to this critical issue.\n\n"
@@ -276,23 +276,23 @@ def demand_letter():
 # Route: Agreement Extraction
 # -----------------------------
 FIELD_PATTERNS = {
-    # Company / Merchant
-    "business_name": r"(?:Merchant|Business Name)\s*[:\s]\s*([A-Za-z0-9&.,' \-]+)",
+    # Merchant / Business
+    "business_name": r"(?:Merchant|Business\s*Name|Merchant\s*Name)\s*[:\-–]\s*([A-Za-z0-9&.,' \-]+)",
 
-    # Dates
-    "effective_date": r"Effective\s*Date\s*[:\s]\s*([A-Za-z]{3,9}\s+\d{1,2}[,]?\s+\d{4}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2})",
+    # Dates (Effective/Agreement/Dated)
+    "effective_date": r"(?:Effective\s*Date|Agreement\s*Date|Dated)\s*[:\-–]\s*([A-Za-z]{3,9}\s+\d{1,2}[,]?\s+\d{4}|\d{1,2}[/-]\d{1,2}[/-]\d{2,4}|\d{4}-\d{2}-\d{2})",
 
     # Amounts
-    "advance_amount": r"(?:Advance\s*Amount|Purchase\s*Price)\s*[:\s]\s*\$?([\d,]+(?:\.\d{2})?)",
-    "fee":            r"(?:Fee|Origination\s*Fee|Financing\s*Fee)\s*[:\s]\s*\$?([\d,]+(?:\.\d{2})?)",
-    "total_advance_plus_fee": r"(?:Total\s*(?:Payment|Advance|Purchase)\s*(?:Amount|Obligation))\s*[:\s]\s*\$?([\d,]+(?:\.\d{2})?)",
+    "advance_amount": r"(?:Advance\s*Amount|Purchased\s*Amount|Purchase\s*Price|Funding\s*Amount)\s*[:\-–]\s*\$?\s*([\d,]+(?:\.\d{2})?)",
+    "fee":            r"(?:Fee|Origination\s*Fee|Financing\s*Fee|Facility\s*Fee|Total\s*Fee)\s*[:\-–]\s*\$?\s*([\d,]+(?:\.\d{2})?)",
+    "total_advance_plus_fee": r"(?:Total\s*(?:Payment|Advance|Purchase|Obligation|Repayment)\s*(?:Amount)?)\s*[:\-–]\s*\$?\s*([\d,]+(?:\.\d{2})?)",
 
-    # RR% (Payment/Remittance Rate)
-    "rr_percent": r"(?:Payment\s*Rate|Remittance\s*Rate|Revenue\s*Share|RR%?)\s*[:\s]\s*([0-9]{1,2}(?:\.\d+)?%?)",
+    # RR% (various terms)
+    "rr_percent": r"(?:Payment\s*Rate|Remittance\s*Rate|Withholding\s*Rate|Revenue\s*Share|Remit\s*Rate|RR%?)\s*[:\-–]\s*([0-9]{1,2}(?:\.\d+)?%?)",
 
-    # Optional context fields
-    "partner": r"(?:Partner|Processor)\s*[:\s]\s*([A-Za-z0-9&.,' \-]+)",
-    "product": r"(?:Product|Capital\s*Product\s*Type)\s*[:\s]\s*([A-Za-z0-9&.,' \-]+)",
+    # Optional context
+    "partner": r"(?:Partner|Processor)\s*[:\-–]\s*([A-Za-z0-9&.,' \-]+)",
+    "product": r"(?:Product|Capital\s*Product\s*Type)\s*[:\-–]\s*([A-Za-z0-9&.,' \-]+)",
 }
 
 @app.post("/agreement-extract")
@@ -310,7 +310,7 @@ def agreement_extract():
     stream = BytesIO(f.read())
     stream.seek(0)
 
-    # Try DOCX first, then PDF
+    # Extract text (DOCX or PDF)
     text = None
     if name.endswith(".docx"):
         text = docx_to_text(stream)
@@ -321,15 +321,49 @@ def agreement_extract():
     if not text or not text.strip():
         return jsonify({
             "ok": False,
-            "error": "Could not read agreement text. If this is a scanned PDF, upload a text-based copy or paste terms."
+            "error": "Could not read agreement text. If this is a scanned PDF, use a text-based copy."
         }), 422
 
+    # Normalize whitespace to be resilient to line breaks/tabs
+    raw_text = text
+    norm = re.sub(r"[ \t]+", " ", text)
+    norm = re.sub(r"\s*[\r\n]+\s*", "\n", norm)
+
+    flags = re.IGNORECASE | re.MULTILINE
     extracted = {}
     for k, pat in FIELD_PATTERNS.items():
-        m = re.search(pat, text, flags=re.IGNORECASE)
+        m = re.search(pat, norm, flags=flags)
         extracted[k] = (m.group(1).strip() if m else None)
 
-    # Normalize outputs
+    # ---------- Fallback heuristics if key amounts/percent missing ----------
+    need_amounts = not any(extracted.get(k) for k in ("advance_amount", "fee", "total_advance_plus_fee"))
+    need_rate    = not extracted.get("rr_percent")
+
+    if need_amounts or need_rate:
+        blocks = re.split(r"\n{2,}", norm)
+        candidate = ""
+        for b in blocks:
+            if re.search(r"(schedule|summary|terms|payment|amount|rate)", b, flags=flags) and (
+                b.count("$") >= 2 or "%" in b
+            ):
+                candidate = b
+                break
+
+        if candidate:
+            if need_amounts and not extracted.get("advance_amount"):
+                m = re.search(r"(advance|purchase|funding).{0,50}\$?\s*([\d,]+(?:\.\d{2})?)", candidate, flags=flags)
+                if m: extracted["advance_amount"] = m.group(2)
+            if need_amounts and not extracted.get("fee"):
+                m = re.search(r"(fee|origination|facility).{0,50}\$?\s*([\d,]+(?:\.\d{2})?)", candidate, flags=flags)
+                if m: extracted["fee"] = m.group(2)
+            if need_amounts and not extracted.get("total_advance_plus_fee"):
+                m = re.search(r"(total\s*(payment|amount|obligation)).{0,50}\$?\s*([\d,]+(?:\.\d{2})?)", candidate, flags=flags)
+                if m: extracted["total_advance_plus_fee"] = m.group(3)
+            if need_rate and not extracted.get("rr_percent"):
+                m = re.search(r"(remit|payment|withholding|revenue\s*share|rate).{0,30}(\d{1,2}(?:\.\d+)?%?)", candidate, flags=flags)
+                if m: extracted["rr_percent"] = m.group(2)
+
+    # ---------- Normalize outputs ----------
     if extracted.get("effective_date"):
         extracted["effective_date"] = norm_date(extracted["effective_date"])
 
@@ -341,15 +375,18 @@ def agreement_extract():
     if extracted.get("rr_percent"):
         extracted["rr_percent"] = normalize_rr(extracted["rr_percent"])
 
+    # Short server-side preview for debugging (appears in Render logs)
+    print("EXTRACTED:", extracted)
+    print("TEXT PREVIEW:", raw_text[:1000])
+
     return jsonify({
         "ok": True,
         "extracted": extracted,
-        "raw_preview": text[:4000]  # truncate preview for debugging
+        "raw_preview": raw_text[:3000]  # optional for client debug
     }), 200
 
 # -----------------------------
 # Local run (optional)
 # -----------------------------
 if __name__ == "__main__":
-    # For local testing only; Render uses gunicorn with $PORT
     app.run(host="0.0.0.0", port=8080)
